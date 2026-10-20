@@ -19,5 +19,13 @@ services:
       - MAX_HEAP_SIZE=1G
       - HEAP_NEWSIZE=200M
 
+  neo4j:
+    image: neo4j:5
+    ports:
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/Lab7StrongPass123
+
 volumes:
   mongo_data:
