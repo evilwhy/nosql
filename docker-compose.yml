@@ -27,5 +27,18 @@ services:
     environment:
       - NEO4J_AUTH=neo4j/Lab7StrongPass123
 
+  # лаба 10: три mongod в одном контейнере, порты 27101-27103 только внутри (127.0.0.1)
+  mongo-rs:
+    image: mongo:8.0.4
+    command: >
+      bash -c "mkdir -p /data/rs1 /data/rs2 /data/rs3 &&
+      mongod --replSet rsLab10 --port 27101 --dbpath /data/rs1 --bind_ip 127.0.0.1 --fork --logpath /data/rs1.log &&
+      mongod --replSet rsLab10 --port 27102 --dbpath /data/rs2 --bind_ip 127.0.0.1 --fork --logpath /data/rs2.log &&
+      mongod --replSet rsLab10 --port 27103 --dbpath /data/rs3 --bind_ip 127.0.0.1 --fork --logpath /data/rs3.log &&
+      tail -f /dev/null"
+    volumes:
+      - mongo_rs_data:/data
+
 volumes:
   mongo_data:
+  mongo_rs_data:

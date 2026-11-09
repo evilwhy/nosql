@@ -1,0 +1,71 @@
+# лаба 10, вариант 3 - заказы интернет магазина
+# все команды по порядку, m = docker exec nosql-mongo-rs-1 mongosh --quiet --port
+
+# стенд
+docker compose up -d mongo-rs
+docker exec nosql-mongo-rs-1 ps -o pid,etime,args -C mongod
+
+# инициализация
+m 27101 --eval 'rs.initiate({_id:"rsLab10",members:[{_id:0,host:"127.0.0.1:27101"},{_id:1,host:"127.0.0.1:27102"},{_id:2,host:"127.0.0.1:27103"}]})'
+m 27101 --eval 'rs.status().members.forEach(m => print(m._id, m.name, m.stateStr, m.health))'
+m 27101 --eval 'rs.hello().primary'
+m 27101 --eval 'db.version()'
+
+# данные
+docker exec -i nosql-mongo-rs-1 mongosh --quiet --port 27101 < lab10/orders.js
+
+# проверка на secondary
+m 27102 --eval 'db.getMongo().setReadPref("secondary"); db.getSiblingDB("shop_lab10").orders.countDocuments()'
+m 27101 --eval 'rs.printSecondaryReplicationInfo()'
+m 27101 --eval 'rs.printReplicationInfo()'
+
+# отказ 1: штатная остановка primary (SIGTERM)
+bash lab10/failover.sh
+docker exec nosql-mongo-rs-1 bash -c 'grep -E "Starting an election|Election succeeded" /data/rs2.log'
+m 27102 --eval 'db.getSiblingDB("shop_lab10").orders.aggregate([{ $group: { _id: null, count: { $sum: 1 }, maxOrderId: { $max: "$orderId" }, sumTotal: { $sum: "$total" } } }])'
+
+# запись на новом primary
+m 27102 --eval 'db.getSiblingDB("shop_lab10").orders.insertMany([
+  { orderId: 23, customerId: 1001, city: "Алматы", status: "new", total: 54990, items: [{ sku: "P-003", qty: 1, price: 54990 }], createdAt: new Date() },
+  { orderId: 24, customerId: 1009, city: "Актобе", status: "new", total: 9990, items: [{ sku: "P-007", qty: 1, price: 9990 }], createdAt: new Date() }
+], { writeConcern: { w: "majority", wtimeout: 5000 } })'
+
+# возврат узла
+docker exec nosql-mongo-rs-1 mongod --replSet rsLab10 --port 27101 --dbpath /data/rs1 --bind_ip 127.0.0.1 --fork --logpath /data/rs1.log
+m 27102 --eval 'rs.status().members.forEach(x => print(x.name, x.stateStr, x.health))'
+m 27101 --eval 'db.getSiblingDB("shop_lab10").orders.countDocuments()'
+m 27101 --eval 'db.getSiblingDB("shop_lab10").orders.find({orderId: {$gte: 23}}, {_id:0, orderId:1, status:1, total:1})'
+
+# отказ 2: primary убит (SIGKILL), параллельно попытки записи
+bash lab10/failover.sh KILL
+docker exec nosql-mongo-rs-1 bash -c 'grep -E "Starting an election|Election succeeded" /data/rs3.log'
+docker exec nosql-mongo-rs-1 mongod --replSet rsLab10 --port 27102 --dbpath /data/rs2 --bind_ip 127.0.0.1 --fork --logpath /data/rs2.log
+docker exec nosql-mongo-rs-1 bash -c 'grep -iE "unclean shutdown|Recovering" /data/rs2.log'
+m 27103 --eval 'db.getSiblingDB("shop_lab10").ping.drop()'
+
+# потеря большинства: гашу два узла, остается один
+docker exec nosql-mongo-rs-1 pkill -TERM -f "port 27101"
+docker exec nosql-mongo-rs-1 pkill -TERM -f "port 27102"
+m 27103 --eval 'rs.status().members.map(x => x.name.split(":")[1] + " " + x.stateStr).join(" | ")'
+m 27103 --eval 'db.getSiblingDB("shop_lab10").orders.countDocuments()'
+m 27103 --eval 'db.getSiblingDB("shop_lab10").orders.insertOne({orderId: 100, customerId: 1, total: 1, status: "new"})'
+docker exec nosql-mongo-rs-1 bash -c 'grep -E "majority of the set|Stepping down" /data/rs3.log'
+docker exec nosql-mongo-rs-1 mongod --replSet rsLab10 --port 27101 --dbpath /data/rs1 --bind_ip 127.0.0.1 --fork --logpath /data/rs1.log
+docker exec nosql-mongo-rs-1 mongod --replSet rsLab10 --port 27102 --dbpath /data/rs2 --bind_ip 127.0.0.1 --fork --logpath /data/rs2.log
+
+# контроль на всех узлах
+for p in 27101 27102 27103; do m $p --eval 'db.getSiblingDB("shop_lab10").orders.aggregate([{ $group: { _id: null, count: { $sum: 1 }, maxOrderId: { $max: "$orderId" }, sumTotal: { $sum: "$total" } } }])'; done
+
+# backup
+docker exec nosql-mongo-rs-1 mongodump --uri="mongodb://127.0.0.1:27101,127.0.0.1:27102,127.0.0.1:27103/?replicaSet=rsLab10" --db=shop_lab10 --out=/data/backup_lab10
+
+# restore в отдельную базу (путь - папка дампа целиком, не подпапка базы)
+docker exec nosql-mongo-rs-1 mongorestore --uri="mongodb://127.0.0.1:27101,127.0.0.1:27102,127.0.0.1:27103/?replicaSet=rsLab10" --nsFrom="shop_lab10.*" --nsTo="shop_restore10.*" /data/backup_lab10
+m 27103 --eval 'show dbs'
+m 27103 --eval 'db.getSiblingDB("shop_restore10").orders.aggregate([{ $group: { _id: null, count: { $sum: 1 }, maxOrderId: { $max: "$orderId" }, sumTotal: { $sum: "$total" } } }])'
+m 27103 --eval 'db.getSiblingDB("shop_restore10").orders.getIndexes().map(i => i.name)'
+m 27103 --eval 'const a = db.getSiblingDB("shop_lab10").orders.find().sort({orderId:1}).toArray(); const b = db.getSiblingDB("shop_restore10").orders.find().sort({orderId:1}).toArray(); print(JSON.stringify(a) === JSON.stringify(b))'
+
+# дамп и экспорт в папку лабы
+docker cp nosql-mongo-rs-1:/data/backup_lab10 lab10/backup_lab10
+docker exec nosql-mongo-rs-1 mongoexport --quiet --port 27103 --db shop_lab10 --collection orders --jsonArray --pretty --sort '{"orderId":1}' > lab10/shop_lab10.orders.json
